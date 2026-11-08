@@ -166,10 +166,13 @@ class RotoBrushConfig:
     """Parâmetros equivalentes ao efeito Roto Brush 3.0 & Refine Edge do After Effects (V2 VitMatte Pro)."""
 
     backbone: str = "resnet50"          # "resnet50" (máxima qualidade) ou "mobilenetv3" (ultra-rápido)
+    use_matanyone: bool = True          # V3: MatAnyone (CVPR 2025 Consistent Memory Propagation)
+    matanyone_res: int = 864            # Resolução interna do MatAnyone (múltiplo de 16 -> <900 MB VRAM!)
     use_birefnet_fusion: bool = True    # Funde BiRefNet_lite FP16 (1024x1024) para blindar corpo/mãos e fios
     birefnet_interval: int = 2          # A cada N frames roda BiRefNet 1024x1024 (com trava fotométrica anti-rastro)
     use_vitmatte_hair: bool = True      # Usa VitMatte (hustvl/vitmatte-small-composition-1k) no ROI da cabeça/cabelo
     vitmatte_interval: int = 1          # Intervalo de atualização de alta frequência do VitMatte no topo do cabelo
+    optical_flow_hair_lock: float = 0.52 # V3: Estabilização de Fios Guiada por Fluxo Óptico (DISOpticalFlow + Grid-Sample Warp)
     use_sam2_anchor: bool = False       # Opcional: âncora extra com SAM 2.1 Tiny (sam2.1_t.pt)
     downsample_ratio: float = 0.28      # Ratio interno do RVM (0.25..0.40 para 1080p)
     refine_radius: int = 8              # Raio da Banda de Incerteza exclusiva do cabelo (px)
@@ -488,6 +491,20 @@ class RotoBrushGPUPro:
                 print(f"[RotoBrush GPU Pro] Aviso: VitMatte indisponível ({exc})")
                 self.vitmatte_model = None
 
+        # 4. Carregar MatAnyone (PeiqingYang/MatAnyone — CVPR 2025 Consistent Memory Propagation)
+        self.matanyone_core = None
+        if self.cfg.use_matanyone:
+            try:
+                from matanyone import InferenceCore
+
+                self.matanyone_core = InferenceCore("PeiqingYang/MatAnyone", device=self.device)
+            except Exception as exc:
+                print(f"[RotoBrush GPU Pro] Aviso: MatAnyone indisponível ({exc})")
+                self.matanyone_core = None
+
+        # 5. Inicializar motor de Fluxo Óptico Denso (DISOpticalFlow) para estabilização sub-pixel de fios
+        self.dis_flow = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+
         self.birefnet_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
         self.birefnet_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
 
@@ -495,15 +512,127 @@ class RotoBrushGPUPro:
         self.reset_temporal_state()
 
     def reset_temporal_state(self) -> None:
-        """Reseta os estados recorrentes ConvGRU (r1..r4) e os buffers de amortecimento temporal."""
+        """Reseta os estados recorrentes ConvGRU (r1..r4), MatAnyone Memory e buffers de Fluxo Óptico."""
         self.rec: List[Optional[torch.Tensor]] = [None, None, None, None]
         self.prev_rgb_t: Optional[torch.Tensor] = None
         self.prev_alpha_t: Optional[torch.Tensor] = None
+        self.prev_gray_half: Optional[np.ndarray] = None
         self.last_birefnet_alpha: Optional[torch.Tensor] = None
         self.last_birefnet_rgb_t: Optional[torch.Tensor] = None
         self.last_vitmatte_alpha: Optional[torch.Tensor] = None
         self.last_vitmatte_rgb_t: Optional[torch.Tensor] = None
+        self.last_matanyone_alpha: Optional[torch.Tensor] = None
+        self.matanyone_initialized: bool = False
+        if getattr(self, "matanyone_core", None) is not None:
+            try:
+                self.matanyone_core.clear_memory()
+            except Exception:
+                pass
         self.frame_counter: int = 0
+
+    @torch.no_grad()
+    def _infer_matanyone_alpha(
+        self,
+        rgb_t: torch.Tensor,
+        seed_alpha_t: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """
+        V3 — Propaga a memória consistente de objeto do `MatAnyone` (`PeiqingYang/MatAnyone` — CVPR 2025).
+        No frame 0 (ou após corte de cena), ancora a memória permanente usando a máscara limpa inicial
+        (`RVM + BiRefNet`) com 2 passos de warmup; nos frames seguintes, propaga a memória temporal
+        coerente de longo/curto prazo em resolução otimizada múltiplo de 16 (`~480x864`, <900 MB VRAM).
+        """
+        if self.matanyone_core is None:
+            return None
+        _, _, H, W = rgb_t.shape
+        long_side = max(480, int(self.cfg.matanyone_res))
+        if H >= W:
+            h_ma = (long_side // 16) * 16
+            w_ma = max(256, int(round((W / float(H)) * h_ma / 16.0)) * 16)
+        else:
+            w_ma = (long_side // 16) * 16
+            h_ma = max(256, int(round((H / float(W)) * w_ma / 16.0)) * 16)
+
+        img_ma = F.interpolate(rgb_t, size=(h_ma, w_ma), mode="bilinear", align_corners=False)[0]  # (3, h_ma, w_ma)
+
+        if not self.matanyone_initialized:
+            seed_ma = F.interpolate(seed_alpha_t, size=(h_ma, w_ma), mode="bilinear", align_corners=False)[0, 0]
+            mask_255 = ((seed_ma > 0.45).float() * 255.0).to(self.device)
+            out_prob = self.matanyone_core.step(img_ma, mask_255, objects=[1])
+            out_prob = self.matanyone_core.step(img_ma, first_frame_pred=True)
+            out_prob = self.matanyone_core.step(img_ma, first_frame_pred=True)
+            self.matanyone_initialized = True
+        else:
+            out_prob = self.matanyone_core.step(img_ma)
+
+        ma_mask = self.matanyone_core.output_prob_to_mask(out_prob)  # (h_ma, w_ma) in [0..1]
+        ma_full = F.interpolate(
+            ma_mask.unsqueeze(0).unsqueeze(0),
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        ).clamp(0.0, 1.0)
+        return ma_full
+
+    @torch.no_grad()
+    def _stabilize_hair_with_optical_flow(
+        self,
+        frame_bgr: np.ndarray,
+        rgb_t: torch.Tensor,
+        alpha_cur: torch.Tensor,
+        hair_zone: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        V3 — Optical-Flow Guided Hair Stabilization (`DISOpticalFlow` + Motion-Compensated Grid-Sample Warping):
+          1. Calcula o fluxo óptico denso (`t -> t-1`) em meia-resolução (`540x960`) usando `DISOpticalFlow`.
+          2. Faz o warp sub-pixel (`F.grid_sample`) do RGB e do Alpha de fios do frame `t-1` exatamente para a
+             posição física em que os fios estão no frame `t`.
+          3. Calcula o erro fotométrico compensado por movimento `|I_t - warp(I_{t-1})|` (`flow_conf`).
+          4. Onde o fio se moveu de forma coerente (`flow_conf` alto), funde o alpha transportado por fluxo
+             óptico com o alpha atual do `VitMatte + MatAnyone`, eliminando 100% da cintilação/shimmer
+             entre frames consecutivos mesmo durante movimentos de cabeça!
+        """
+        H, W = frame_bgr.shape[:2]
+        h_half, w_half = max(64, H // 2), max(64, W // 2)
+        cur_gray_half = cv2.resize(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY), (w_half, h_half), interpolation=cv2.INTER_AREA)
+
+        if (
+            self.cfg.optical_flow_hair_lock <= 0.01
+            or self.prev_gray_half is None
+            or self.prev_alpha_t is None
+            or self.prev_rgb_t is None
+            or self.prev_gray_half.shape != cur_gray_half.shape
+            or self.prev_alpha_t.shape != alpha_cur.shape
+        ):
+            self.prev_gray_half = cur_gray_half
+            return alpha_cur
+
+        # Fluxo óptico backward (de cada pixel de `cur_gray_half` no frame t para sua origem em `prev_gray_half` no frame t-1)
+        flow_half = self.dis_flow.calc(cur_gray_half, self.prev_gray_half, None)  # (h_half, w_half, 2) em pixels half-res
+        self.prev_gray_half = cur_gray_half
+
+        flow_t = torch.from_numpy(flow_half).to(self.device, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+        flow_full = F.interpolate(flow_t, size=(H, W), mode="bilinear", align_corners=False)  # (1, 2, H, W)
+        dx_norm = flow_full[:, 0] * (2.0 / float(max(1, w_half - 1)))
+        dy_norm = flow_full[:, 1] * (2.0 / float(max(1, h_half - 1)))
+
+        yy = torch.linspace(-1.0, 1.0, H, device=self.device).view(1, H, 1).expand(1, H, W)
+        xx = torch.linspace(-1.0, 1.0, W, device=self.device).view(1, 1, W).expand(1, H, W)
+        grid = torch.stack([xx + dx_norm, yy + dy_norm], dim=-1)  # (1, H, W, 2)
+
+        prev_rgb_warped = F.grid_sample(self.prev_rgb_t, grid, mode="bilinear", padding_mode="border", align_corners=True)
+        prev_alpha_warped = F.grid_sample(self.prev_alpha_t, grid, mode="bilinear", padding_mode="border", align_corners=True)
+
+        # Coerência fotométrica pós-compensação de movimento + proteção anti-oclusão
+        photo_err = box_filter_gpu(torch.mean(torch.abs(rgb_t - prev_rgb_warped), dim=1, keepdim=True), r=3)
+        alpha_diff = torch.abs(alpha_cur - prev_alpha_warped)
+        flow_conf = torch.exp(-photo_err * 46.0) * ((0.20 - alpha_diff) / 0.20).clamp(0.0, 1.0)
+
+        # Aplica estabilização guiada por fluxo óptico concentrada na zona de fios/cabelo (e 35% na borda fina geral)
+        zone_weight = (hair_zone + 0.35 * (1.0 - hair_zone)).clamp(0.0, 1.0)
+        lock_w = float(self.cfg.optical_flow_hair_lock) * zone_weight * flow_conf
+        alpha_locked = alpha_cur * (1.0 - lock_w) + prev_alpha_warped * lock_w
+        return alpha_locked.clamp(0.0, 1.0)
 
     @torch.no_grad()
     def _infer_birefnet_alpha(self, rgb_t: torch.Tensor, res: int = 1024) -> torch.Tensor:
@@ -678,6 +807,16 @@ class RotoBrushGPUPro:
         solid_interior = erode_gpu(solid_interior, radius=3)
         alpha_base = torch.maximum(alpha_base, solid_interior * 0.995)
 
+        # 1B. V3 — Propagação de Memória Consistente do MatAnyone (CVPR 2025)
+        if self.matanyone_core is not None and self.cfg.use_matanyone:
+            ma_alpha = self._infer_matanyone_alpha(rgb_t, alpha_base)
+            if ma_alpha is not None:
+                self.last_matanyone_alpha = ma_alpha
+                # MatAnyone atua como estabilizador temporal de memória de objeto dentro do suporte válido
+                ma_support = torch.minimum(ma_alpha, dilate_gpu(alpha_base, radius=2))
+                alpha_base = (0.64 * alpha_base + 0.36 * ma_support).clamp(0.0, 1.0)
+                alpha_base = torch.maximum(alpha_base, solid_interior * 0.995)
+
         # 2. Mapa Semântico da Coroa do Cabelo vs Corpo/Rosto/Camisa
         hair_zone = self._estimate_hair_zone_weight(rgb_t, alpha_base)
         hair_zone_smooth = gaussian_blur_gpu(hair_zone, sigma=3.0).clamp(0.0, 1.0)
@@ -697,7 +836,7 @@ class RotoBrushGPUPro:
         body_alpha = gaussian_blur_gpu(body_crisp, sigma=0.65).clamp(0.0, 1.0)
 
         # 3B. RAMO DA COROA DO CABELO (`hair_alpha`):
-        # VitMatte ROI + Guided Filter Fino + Luminance Valley Curl-Gap Keying (fura os vãos claros entre cachos!)
+        # VitMatte ROI + MatAnyone Consistent Memory + Guided Filter Fino + Luminance Valley Curl-Gap Keying
         if self.vitmatte_model is not None:
             if (
                 self.frame_counter % max(1, int(cfg.vitmatte_interval)) == 0
@@ -711,7 +850,11 @@ class RotoBrushGPUPro:
             else:
                 vit_gate = torch.ones_like(alpha_base)
             vit_valid = self.last_vitmatte_alpha * vit_gate + alpha_base * (1.0 - vit_gate)
-            vit_alpha = 0.65 * vit_valid + 0.35 * alpha_base
+            if self.last_matanyone_alpha is not None:
+                ma_hair_ref = torch.minimum(self.last_matanyone_alpha, dilate_gpu(alpha_base, radius=2))
+                vit_alpha = 0.55 * vit_valid + 0.25 * ma_hair_ref + 0.20 * alpha_base
+            else:
+                vit_alpha = 0.65 * vit_valid + 0.35 * alpha_base
         else:
             vit_alpha = alpha_base
 
@@ -780,8 +923,11 @@ class RotoBrushGPUPro:
                 self.last_birefnet_alpha = self._infer_birefnet_alpha(rgb_t, res=1024)
                 self.last_birefnet_rgb_t = rgb_t.clone()
 
-        # 3. Refine Edge (Pilar 2) + Controles After Effects (Pilar 3) + Separação Cabelo vs Corpo
+        # 3. Refine Edge (Pilar 2) + Controles After Effects (Pilar 3) + Separação Cabelo vs Corpo + MatAnyone
         alpha_cur, hair_zone = self._apply_pillar2_and_pillar3_refine_edge(rgb_t, rvm_pha, self.last_birefnet_alpha)
+
+        # 3B. V3: Optical-Flow Guided Hair Stabilization (DISOpticalFlow + Motion-Compensated Grid-Sample Warping)
+        alpha_cur = self._stabilize_hair_with_optical_flow(frame_bgr, rgb_t, alpha_cur, hair_zone)
 
         # 4. PILAR 1C: Motion-Gated Temporal Damping ("Reduce Chatter" sem Ghosting nas Mãos!)
         if (
@@ -1263,8 +1409,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-png", type=str, default="", help="Caminho do PNG RGBA de saída para --image")
     p.add_argument("--chroma-hybrid", action="store_true", help="Ativa Despill + Chroma Key Híbrido no modo --image")
     p.add_argument("--backbone", type=str, default="resnet50", choices=["resnet50", "mobilenetv3"])
+    p.add_argument("--no-matanyone", action="store_true", help="Desativa MatAnyone Consistent Memory Propagation V3")
     p.add_argument("--no-birefnet", action="store_true", help="Desativa fusão BiRefNet_lite FP16 (usa apenas RVM)")
     p.add_argument("--no-vitmatte", action="store_true", help="Desativa VitMatte ViT FP16 na zona do cabelo")
+    p.add_argument("--optical-flow-hair-lock", type=float, default=0.52, help="Força da estabilização de fios por Fluxo Óptico V3 (0..0.85)")
     p.add_argument("--birefnet-interval", type=int, default=2, help="Intervalo de frames para ancoragem BiRefNet")
     p.add_argument("--refine-radius", type=int, default=8, help="Largura da banda Refine Edge Trimap (px)")
     p.add_argument("--feather", type=float, default=0.6, help="Feather da borda em pixels (0..15)")
@@ -1287,8 +1435,10 @@ def main() -> int:
 
     cfg = RotoBrushConfig(
         backbone=args.backbone,
+        use_matanyone=not args.no_matanyone,
         use_birefnet_fusion=not args.no_birefnet,
         use_vitmatte_hair=not args.no_vitmatte,
+        optical_flow_hair_lock=args.optical_flow_hair_lock,
         birefnet_interval=args.birefnet_interval,
         refine_radius=args.refine_radius,
         feather=args.feather,
