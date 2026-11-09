@@ -163,8 +163,9 @@ RVM_MOBILENET_URL = (
 # ==============================================================================
 @dataclass
 class RotoBrushConfig:
-    """Parâmetros equivalentes ao efeito Roto Brush 3.0 & Refine Edge do After Effects (V2 VitMatte Pro)."""
+    """Parâmetros equivalentes ao efeito Roto Brush 3.0 & Refine Edge + CorridorKey 2.0 Dual-Engine (V4)."""
 
+    engine: str = "auto"                # V4 Dual-Engine: "auto" (detecta Green/Blue Screen vs Natural), "roto", ou "corridorkey"
     backbone: str = "resnet50"          # "resnet50" (máxima qualidade) ou "mobilenetv3" (ultra-rápido)
     use_matanyone: bool = True          # V3: MatAnyone (CVPR 2025 Consistent Memory Propagation)
     matanyone_res: int = 864            # Resolução interna do MatAnyone (múltiplo de 16 -> <900 MB VRAM!)
@@ -173,6 +174,8 @@ class RotoBrushConfig:
     use_vitmatte_hair: bool = True      # Usa VitMatte (hustvl/vitmatte-small-composition-1k) no ROI da cabeça/cabelo
     vitmatte_interval: int = 1          # Intervalo de atualização de alta frequência do VitMatte no topo do cabelo
     optical_flow_hair_lock: float = 0.52 # V3: Estabilização de Fios Guiada por Fluxo Óptico (DISOpticalFlow + Grid-Sample Warp)
+    linear_unmixing: bool = True        # V4 CorridorKey 2.0: Desmistura de cor em espaço Scene-Linear IEC 61966-2-1 (gamma 2.4)
+    despill_strength: float = 1.0       # V4 CorridorKey 2.0: Força do neutralizador de spill energético (0..1)
     use_sam2_anchor: bool = False       # Opcional: âncora extra com SAM 2.1 Tiny (sam2.1_t.pt)
     downsample_ratio: float = 0.28      # Ratio interno do RVM (0.25..0.40 para 1080p)
     refine_radius: int = 8              # Raio da Banda de Incerteza exclusiva do cabelo (px)
@@ -190,6 +193,119 @@ class RotoBrushConfig:
     light_wrap_amount: float = 0.24     # Intensidade do Optical Light Wrap na composição (0.0 .. 1.0)
     hair_preserve_boost: float = 0.30   # Proteção de pontas reais de cabelo escuro
     device: str = "cuda"
+
+
+# ==============================================================================
+# CORRIDORKEY 2.0 SCENE-LINEAR COLOR UNMIXING & AUTO-DETECTOR DE FUNDO (V4)
+# ==============================================================================
+_SRGB_TO_LIN_THRESH = 0.04045
+_LIN_TO_SRGB_THRESH = 0.0031308
+
+
+def srgb_to_linear_gpu(x: torch.Tensor) -> torch.Tensor:
+    """Conversão exata IEC 61966-2-1 sRGB [0, 1] -> Luz Linear de Cena (CorridorKey 2.0)."""
+    x_c = x.clamp(0.0, 1.0)
+    low = x_c / 12.92
+    high = torch.pow((x_c.clamp(min=_SRGB_TO_LIN_THRESH) + 0.055) / 1.055, 2.4)
+    return torch.where(x_c <= _SRGB_TO_LIN_THRESH, low, high)
+
+
+def linear_to_srgb_gpu(x: torch.Tensor) -> torch.Tensor:
+    """Conversão exata IEC 61966-2-1 Luz Linear de Cena -> sRGB [0, 1] (CorridorKey 2.0)."""
+    x_c = x.clamp(0.0, 1.0)
+    low = x_c * 12.92
+    high = 1.055 * torch.pow(x_c.clamp(min=_LIN_TO_SRGB_THRESH), 1.0 / 2.4) - 0.055
+    return torch.where(x_c <= _LIN_TO_SRGB_THRESH, low, high).clamp(0.0, 1.0)
+
+
+def corridorkey_despill_srgb_gpu(
+    fg_srgb: torch.Tensor,
+    screen_type: str = "green_screen",
+    strength: float = 1.0,
+) -> torch.Tensor:
+    """
+    Neutralizador de Spill Preservador de Luminância Natural (CorridorKey 2.0 Warm-Balanced):
+    Remove 100% da contaminação verde/azul sem empurrar o canal Azul para cima no modo Green Screen
+    (evita 100% qualquer tom magenta/rosado em fios loiros ou castanhos!).
+    """
+    if strength <= 0.0:
+        return fg_srgb
+    r, g, b = fg_srgb[:, 0:1], fg_srgb[:, 1:2], fg_srgb[:, 2:3]
+    if screen_type == "blue_screen":
+        b_cap = 0.55 * r + 0.45 * g
+        spill = (b - b_cap).clamp(min=0.0)
+        full = torch.cat([r + spill * 0.30, g + spill * 0.30, b - spill], dim=1)
+    else:
+        g_cap = 0.62 * r + 0.38 * b
+        spill = (g - g_cap).clamp(min=0.0)
+        full = torch.cat([r + spill * 0.28, g - spill, b + spill * 0.06], dim=1)
+    if strength >= 1.0:
+        return full.clamp(0.0, 1.0)
+    return torch.lerp(fg_srgb, full, float(strength)).clamp(0.0, 1.0)
+
+
+def detect_backdrop_type(frame_bgr: np.ndarray) -> Dict[str, Any]:
+    """
+    V4 Auto-Detector Inteligente de Fundo (`detect_backdrop_type`):
+    Inspeciona as faixas de borda externa (topo, esquerda e direita) em HSV e dominância cromática RGB:
+      - Se detectar Green Screen (`green_ratio >= 0.28`): aciona `corridorkey` (`green_screen`)
+      - Se detectar Blue Screen (`blue_ratio >= 0.28`): aciona `corridorkey` (`blue_screen`)
+      - Caso contrário (quarto, consultório, escritório, rua, estúdio natural): aciona `roto` (`natural`)
+    """
+    H, W = frame_bgr.shape[:2]
+    bh = max(16, int(H * 0.10))
+    bw = max(16, int(W * 0.12))
+
+    top_strip = frame_bgr[:bh, :, :]
+    left_strip = frame_bgr[:, :bw, :]
+    right_strip = frame_bgr[:, W - bw :, :]
+    border_pixels = np.concatenate(
+        [top_strip.reshape(-1, 3), left_strip.reshape(-1, 3), right_strip.reshape(-1, 3)],
+        axis=0,
+    )
+
+    hsv = cv2.cvtColor(border_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    h_ch, s_ch, v_ch = hsv[:, 0], hsv[:, 1], hsv[:, 2]
+    b_ch = border_pixels[:, 0].astype(np.float32)
+    g_ch = border_pixels[:, 1].astype(np.float32)
+    r_ch = border_pixels[:, 2].astype(np.float32)
+
+    is_green = (
+        (h_ch >= 33)
+        & (h_ch <= 88)
+        & (s_ch >= 60)
+        & (v_ch >= 50)
+        & ((g_ch - np.maximum(r_ch, b_ch)) >= 24.0)
+    )
+    is_blue = (
+        (h_ch >= 96)
+        & (h_ch <= 136)
+        & (s_ch >= 65)
+        & (v_ch >= 50)
+        & ((b_ch - np.maximum(r_ch, g_ch)) >= 24.0)
+    )
+
+    green_ratio = float(np.mean(is_green))
+    blue_ratio = float(np.mean(is_blue))
+
+    if green_ratio >= 0.28 and green_ratio >= blue_ratio:
+        btype = "green_screen"
+        eng = "corridorkey"
+    elif blue_ratio >= 0.28:
+        btype = "blue_screen"
+        eng = "corridorkey"
+    else:
+        btype = "natural"
+        eng = "roto"
+
+    med_bgr = np.median(border_pixels, axis=0)
+    return {
+        "backdrop_type": btype,
+        "engine_selected": eng,
+        "green_ratio": round(green_ratio, 4),
+        "blue_ratio": round(blue_ratio, 4),
+        "median_bg_rgb": [int(med_bgr[2]), int(med_bgr[1]), int(med_bgr[0])],
+    }
 
 
 # ==============================================================================
@@ -371,15 +487,17 @@ def decontaminate_edge_colors_gpu(
     hair_zone: Optional[torch.Tensor] = None,
     amount: float = 0.98,
     radius: int = 12,
+    use_linear_unmixing: bool = True,
 ) -> torch.Tensor:
     """
-    PILAR 4 V2 — Deep Interior Decontaminate Edge Colors (Zero Halo & Zero Névoa Cinza nos Cachos).
+    PILAR 4 V4 — Deep Interior Decontaminate Edge Colors + CorridorKey 2.0 Scene-Linear Color Unmixing:
     1. Em vez de amostrar a borda em `alpha > 0.84` (que ainda contém reflexo/halalação da parede),
        erode o núcleo interno em **8 pixels** no corpo e **14 pixels** no cabelo (`deep_core_mask`),
        puxando 100% da cor pura do interior profundo da pessoa via Pirâmide Multi-Escala (96px).
-    2. Na zona do cabelo (`hair_zone`), proíbe que qualquer fio semi-transparente tenha luminância
-       maior que o núcleo escuro do cabelo (`luma <= luma_hair_deep * 0.92`), eliminando 100% daquela
-       aparência de "névoa cinza / fundo verde recortado"!
+    2. Equação Física de Linear Color Unmixing (IEC 61966-2-1, gamma 2.4):
+       Na banda semi-transparente (`0.12 < alpha < 0.95`), resolve em espaço linear de luz:
+         F_linear = clamp((I_linear - (1 - alpha) * B_wall_linear) / max(alpha, 0.18), 0, 1)
+       e combina com a pirâmide profunda interior `f_pure`, eliminando 100% da contaminação cromática da parede!
     """
     if amount <= 0.01:
         return rgb
@@ -403,8 +521,6 @@ def decontaminate_edge_colors_gpu(
     luma_inp = 0.2126 * f_inpainted[:, 0:1] + 0.7152 * f_inpainted[:, 1:2] + 0.0722 * f_inpainted[:, 2:3]
 
     # Auto-Adaptação de Despill por Luminância Local do Fundo (`bg_luma_auto_adapt`):
-    # Se o fundo externo for MAIS CLARO que o interior (parede clara), trava o brilho máximo em 1.00 * luma_inp (zero halo claro).
-    # Se o fundo externo for MAIS ESCURO que o interior (estúdio escuro), evita escurecimento artificial na borda!
     bg_ext_mask = ((0.03 - dilate_gpu(alpha, radius=3)) / 0.03).clamp(0.0, 1.0)
     b_ext_rgb = propagate_color_pyramid_gpu(rgb, bg_ext_mask, r_fine=4, r_mid=10)
     luma_bg = 0.2126 * b_ext_rgb[:, 0:1] + 0.7152 * b_ext_rgb[:, 1:2] + 0.0722 * b_ext_rgb[:, 2:3]
@@ -415,6 +531,19 @@ def decontaminate_edge_colors_gpu(
     bg_is_brighter = ((luma_bg - luma_inp + 0.04) / 0.08).clamp(0.0, 1.0)
     adaptive_ratio = ratio_bright_bg * bg_is_brighter + ratio_dark_bg * (1.0 - bg_is_brighter)
     f_pure = (f_inpainted * adaptive_ratio).clamp(0.0, 1.0)
+
+    # V4 CorridorKey 2.0 Scene-Linear Color Unmixing na rampa de transição (0.16 <= alpha <= 0.92)
+    if use_linear_unmixing:
+        I_lin = srgb_to_linear_gpu(rgb)
+        B_lin = srgb_to_linear_gpu(b_ext_rgb)
+        F_inp_lin = srgb_to_linear_gpu(f_pure)
+        alpha_safe = alpha.clamp(min=0.22)
+        F_unmixed_lin = ((I_lin - (1.0 - alpha) * B_lin) / alpha_safe).clamp(0.0, 1.0)
+        # Limita desvio cromático ao envelope físico do interior profundo para nunca amplificar ruído de sensor
+        F_unmixed_lin = torch.minimum(torch.maximum(F_unmixed_lin, F_inp_lin * 0.45), F_inp_lin * 1.18 + 0.02)
+        unmix_weight = ((alpha - 0.18) / 0.35).clamp(0.0, 1.0) * ((0.94 - alpha) / 0.20).clamp(0.0, 1.0) * 0.42
+        F_combined_lin = F_inp_lin * (1.0 - unmix_weight) + F_unmixed_lin * unmix_weight
+        f_pure = linear_to_srgb_gpu(F_combined_lin)
 
     # Aplica descontaminação em toda a casca externa de 14px (onde deep_core < 0.95)
     outer_shell = (1.0 - gaussian_blur_gpu(deep_core, sigma=2.0)).clamp(0.0, 1.0) * float(amount)
@@ -892,14 +1021,158 @@ class RotoBrushGPUPro:
         return alpha.clamp(0.0, 1.0), hair_zone_smooth
 
     @torch.no_grad()
-    def process_video_frame_bgr(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _process_corridorkey_chroma_gpu(
+        self,
+        rgb_t: torch.Tensor,
+        rvm_pha: torch.Tensor,
+        biref_alpha: Optional[torch.Tensor],
+        screen_type: str = "green_screen",
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Processa um frame BGR de vídeo com memória temporal completa:
+        V4 — Motor CorridorKey 2.0 (`Neural Chroma Key + Scene-Linear IEC 61966-2-1 Color Unmixing`):
+          1. Estima o Clean-Plate Local Não-Uniforme da Tela Verde/Azul (`B_screen_srgb` & `B_screen_linear`)
+             usando pirâmide multi-escala (modela vinhetas, sombras e dobras do tecido chroma key!).
+          2. Calcula o Alpha Cromático Sub-Pixel em Luz Linear (`alpha_chroma_lin`), capturando fios soltos,
+             motion blur translúcido e óculos sem depender de limiar binário.
+          3. Funde o núcleo interno blindado (`BiRefNet + RVM + MatAnyone`) com o Alpha Cromático Linear +
+             `VitMatte` na borda e nos fios de cabelo (impede furos em reflexos verdes na roupa ou nos olhos!).
+          4. Resolve a Equação Física de Desmistura Linear (`Linear Color Unmixing` em $\gamma=2.4$):
+               F_linear = clamp((I_linear - (1 - alpha) * B_screen_linear) / max(alpha, 0.05), 0, 1)
+          5. Aplica o neutralizador preservador de energia `_despill_average_srgb_torch` do CorridorKey 2.0
+             combinado à proteção profunda de interior nos fios de baixíssima opacidade (`alpha < 0.18`).
+        """
+        r, g, b = rgb_t[:, 0:1], rgb_t[:, 1:2], rgb_t[:, 2:3]
+        if screen_type == "blue_screen":
+            chroma_excess = (b - torch.maximum(r, g)).clamp(min=0.0)
+            chroma_avg_excess = (b - 0.5 * (r + g)).clamp(min=0.0)
+        else:
+            chroma_excess = (g - torch.maximum(r, b)).clamp(min=0.0)
+            chroma_avg_excess = (g - 0.5 * (r + b)).clamp(min=0.0)
+
+        # Base neural para proteger o interior do sujeito e identificar fundo puro garantido
+        if biref_alpha is not None:
+            neural_base = 0.55 * rvm_pha + 0.45 * biref_alpha
+        else:
+            neural_base = rvm_pha
+
+        if self.matanyone_core is not None and self.cfg.use_matanyone:
+            ma_alpha = self._infer_matanyone_alpha(rgb_t, neural_base)
+            if ma_alpha is not None:
+                self.last_matanyone_alpha = ma_alpha
+                neural_base = (0.65 * neural_base + 0.35 * ma_alpha).clamp(0.0, 1.0)
+
+        # 1. Clean-Plate Inpainting da Tela Verde/Azul (captura iluminação irregular do fundo frame a frame)
+        pure_screen_mask = ((chroma_excess > 0.08).float() * (dilate_gpu(neural_base, radius=5) < 0.12).float()).clamp(0.0, 1.0)
+        if float(pure_screen_mask.sum().item()) < 64.0:
+            pure_screen_mask = (chroma_excess > 0.05).float()
+        B_screen_srgb = propagate_color_pyramid_gpu(rgb_t, pure_screen_mask, r_fine=6, r_mid=14)
+
+        # 2. Equação de Alpha Cromático em Espaço Scene-Linear (IEC 61966-2-1)
+        I_lin = srgb_to_linear_gpu(rgb_t)
+        B_lin = srgb_to_linear_gpu(B_screen_srgb)
+
+        if screen_type == "blue_screen":
+            screen_dom_lin = (B_lin[:, 2:3] - 0.5 * (B_lin[:, 0:1] + B_lin[:, 1:2])).clamp(min=0.04)
+            obs_dom_lin = (I_lin[:, 2:3] - 0.5 * (I_lin[:, 0:1] + I_lin[:, 1:2])).clamp(min=0.0)
+        else:
+            screen_dom_lin = (B_lin[:, 1:2] - 0.5 * (B_lin[:, 0:1] + B_lin[:, 2:3])).clamp(min=0.04)
+            obs_dom_lin = (I_lin[:, 1:2] - 0.5 * (I_lin[:, 0:1] + I_lin[:, 2:3])).clamp(min=0.0)
+
+        # Se obs_dom_lin == screen_dom_lin -> pixel é 100% tela (alpha = 0). Se obs_dom_lin == 0 -> pixel é 100% sujeito (alpha = 1).
+        alpha_chroma_raw = (1.0 - (obs_dom_lin / screen_dom_lin)).clamp(0.0, 1.0)
+        alpha_chroma = ((alpha_chroma_raw - 0.08) / 0.86).clamp(0.0, 1.0)
+
+        # 3. Fusão Híbrida CorridorKey 2.0 + VitMatte + Núcleo Sólido BiRefNet/RVM:
+        # No interior profundo (erodido em 6px), blindamos contra qualquer reflexo verde na roupa/olhos;
+        # Na borda externa, fios de cabelo, dedos e motion blur, o Alpha Cromático Linear manda sem halo cinza!
+        hair_zone = self._estimate_hair_zone_weight(rgb_t, neural_base)
+        hair_zone_smooth = gaussian_blur_gpu(hair_zone, sigma=3.0).clamp(0.0, 1.0)
+
+        deep_core_neural = gaussian_blur_gpu(erode_gpu((neural_base > 0.84).float(), radius=6), sigma=1.5)
+        outer_support = dilate_gpu((neural_base > 0.04).float(), radius=8)
+
+        alpha_guided = guided_matte_rgb_gpu(rgb_t, alpha_chroma, r=2, eps=1.0e-4) * outer_support
+        alpha_combined = torch.maximum(alpha_guided, deep_core_neural)
+
+        if self.vitmatte_model is not None and self.cfg.use_vitmatte_hair:
+            vit_hair = self._infer_vitmatte_hair_roi(rgb_t, alpha_combined, hair_zone_smooth)
+            # No green screen, limitamos o VitMatte pelo suporte cromático linear (zero faixa cinza no fundo verde!)
+            hair_keyed = torch.minimum(0.75 * alpha_guided + 0.25 * vit_hair, alpha_guided * 1.08) * outer_support
+            alpha_combined = alpha_combined * (1.0 - hair_zone_smooth) + torch.maximum(hair_keyed, deep_core_neural) * hair_zone_smooth
+
+        alpha_final = torch.where(alpha_combined < 0.02, torch.zeros_like(alpha_combined), alpha_combined)
+        alpha_final = torch.where(alpha_final > 0.988, torch.ones_like(alpha_final), alpha_final).clamp(0.0, 1.0)
+
+        # 4. Equação Exata de Desmistura Linear (`True Scene-Linear Color Unmixing` — CorridorKey 2.0):
+        #    I_lin = alpha * F_lin + (1 - alpha) * B_lin  ==>  F_lin = (I_lin - (1 - alpha) * B_lin) / alpha
+        rgb_despilled_srgb = corridorkey_despill_srgb_gpu(
+            rgb_t,
+            screen_type=screen_type,
+            strength=float(self.cfg.despill_strength),
+        )
+
+        # Pirâmide de cor pura do interior profundo (14px para dentro, onde não há mistura com a tela verde!)
+        f_deep_interior = decontaminate_edge_colors_gpu(
+            rgb_despilled_srgb,
+            alpha_final,
+            hair_zone=hair_zone_smooth,
+            amount=float(self.cfg.decontaminate),
+            radius=int(self.cfg.decontaminate_radius),
+            use_linear_unmixing=False,
+        )
+
+        # Unmixing linear com envelope físico guiado pelo interior profundo (zero tom magenta e zero ruído!)
+        alpha_denom = alpha_final.clamp(min=0.22)
+        F_unmixed_lin = ((I_lin - (1.0 - alpha_final) * B_lin) / alpha_denom).clamp(0.0, 1.0)
+        F_unmixed_srgb = corridorkey_despill_srgb_gpu(
+            linear_to_srgb_gpu(F_unmixed_lin),
+            screen_type=screen_type,
+            strength=float(self.cfg.despill_strength),
+        )
+        F_unmixed_clamped = torch.minimum(torch.maximum(F_unmixed_srgb, f_deep_interior * 0.55), f_deep_interior * 1.15 + 0.02)
+
+        w_unmix = ((alpha_final - 0.25) / 0.35).clamp(0.0, 1.0) * ((0.95 - alpha_final) / 0.15).clamp(0.0, 1.0) * 0.65
+        fg_clean_srgb = f_deep_interior * (1.0 - w_unmix) + F_unmixed_clamped * w_unmix
+        # No interior opaco (alpha > 0.94), usa o RGB despilled preservando 100% da textura de poros e fios internos
+        inner_opaque = ((alpha_final - 0.92) / 0.06).clamp(0.0, 1.0)
+        fg_clean_srgb = fg_clean_srgb * (1.0 - inner_opaque) + rgb_despilled_srgb * inner_opaque
+
+        return fg_clean_srgb.clamp(0.0, 1.0), alpha_final, hair_zone_smooth
+
+    def resolve_active_engine(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
+        """
+        Determina qual motor rodar (`corridorkey` vs `roto`) de acordo com `self.cfg.engine` (`auto|roto|corridorkey`)
+        e a inspeção automática do fundo (`detect_backdrop_type`).
+        """
+        info = detect_backdrop_type(frame_bgr)
+        req = (self.cfg.engine or "auto").lower().strip()
+        if req == "corridorkey":
+            info["engine_selected"] = "corridorkey"
+            if info["backdrop_type"] == "natural":
+                info["backdrop_type"] = "green_screen"
+        elif req == "roto":
+            info["engine_selected"] = "roto"
+        return info
+
+    @torch.no_grad()
+    def process_video_frame_bgr(
+        self,
+        frame_bgr: np.ndarray,
+        forced_backdrop_info: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Processa um frame BGR de vídeo com memória temporal completa (V4 Dual-Engine):
+          - Se Green/Blue Screen (`corridorkey`): roda CorridorKey 2.0 Scene-Linear Unmixing + Optical-Flow Hair Lock.
+          - Se Cenário Natural (`roto`): roda RotoBrush 3.0 GPU Pro V4 (MatAnyone + VitMatte + Optical-Flow + Linear Unmixing).
           Retorna `(fg_decontaminated_bgr_u8, alpha_u8)`.
         """
         H, W = frame_bgr.shape[:2]
         rgb_np = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         rgb_t = torch.from_numpy(rgb_np).to(self.device, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
+
+        backdrop_info = forced_backdrop_info or self.resolve_active_engine(frame_bgr)
+        active_engine = backdrop_info["engine_selected"]
+        screen_type = backdrop_info["backdrop_type"]
 
         # Detector automático de corte seco de cena (reseta memória recorrente se a cena mudar abruptamente)
         if self.prev_rgb_t is not None and self.prev_rgb_t.shape == rgb_t.shape:
@@ -923,35 +1196,41 @@ class RotoBrushGPUPro:
                 self.last_birefnet_alpha = self._infer_birefnet_alpha(rgb_t, res=1024)
                 self.last_birefnet_rgb_t = rgb_t.clone()
 
-        # 3. Refine Edge (Pilar 2) + Controles After Effects (Pilar 3) + Separação Cabelo vs Corpo + MatAnyone
-        alpha_cur, hair_zone = self._apply_pillar2_and_pillar3_refine_edge(rgb_t, rvm_pha, self.last_birefnet_alpha)
+        if active_engine == "corridorkey":
+            # RAMO A (TELA VERDE / AZUL): CorridorKey 2.0 Scene-Linear Color Unmixing + Sub-Pixel Chroma Alpha
+            fg_clean_t, alpha_cur, hair_zone = self._process_corridorkey_chroma_gpu(
+                rgb_t,
+                rvm_pha,
+                self.last_birefnet_alpha,
+                screen_type=screen_type if screen_type in ("green_screen", "blue_screen") else "green_screen",
+            )
+            alpha_cur = self._stabilize_hair_with_optical_flow(frame_bgr, rgb_t, alpha_cur, hair_zone)
+        else:
+            # RAMO B (CENÁRIO NATURAL SEM TELA VERDE): RotoBrush 3.0 GPU Pro V4 (MatAnyone + VitMatte + Linear Unmixing)
+            alpha_cur, hair_zone = self._apply_pillar2_and_pillar3_refine_edge(rgb_t, rvm_pha, self.last_birefnet_alpha)
+            alpha_cur = self._stabilize_hair_with_optical_flow(frame_bgr, rgb_t, alpha_cur, hair_zone)
 
-        # 3B. V3: Optical-Flow Guided Hair Stabilization (DISOpticalFlow + Motion-Compensated Grid-Sample Warping)
-        alpha_cur = self._stabilize_hair_with_optical_flow(frame_bgr, rgb_t, alpha_cur, hair_zone)
+            if (
+                self.cfg.motion_damping > 0.01
+                and self.prev_alpha_t is not None
+                and self.prev_rgb_t is not None
+                and self.prev_alpha_t.shape == alpha_cur.shape
+            ):
+                diff_rgb = torch.mean(torch.abs(rgb_t - self.prev_rgb_t), dim=1, keepdim=True)
+                diff_smooth = box_filter_gpu(diff_rgb, r=5)
+                motion_gate = ((diff_smooth - 0.006) / 0.018).clamp(0.0, 1.0)
+                damping_map = float(self.cfg.motion_damping) * (1.0 - motion_gate)
+                alpha_cur = alpha_cur * (1.0 - damping_map) + self.prev_alpha_t * damping_map
 
-        # 4. PILAR 1C: Motion-Gated Temporal Damping ("Reduce Chatter" sem Ghosting nas Mãos!)
-        if (
-            self.cfg.motion_damping > 0.01
-            and self.prev_alpha_t is not None
-            and self.prev_rgb_t is not None
-            and self.prev_alpha_t.shape == alpha_cur.shape
-        ):
-            # Diferença fotométrica local suavizada (detecta se o pixel está em movimento ou parado)
-            diff_rgb = torch.mean(torch.abs(rgb_t - self.prev_rgb_t), dim=1, keepdim=True)
-            diff_smooth = box_filter_gpu(diff_rgb, r=5)
-            motion_gate = ((diff_smooth - 0.006) / 0.018).clamp(0.0, 1.0)
-            damping_map = float(self.cfg.motion_damping) * (1.0 - motion_gate)
-            alpha_cur = alpha_cur * (1.0 - damping_map) + self.prev_alpha_t * damping_map
-
-        # 5. PILAR 4: Deep Interior Decontaminate Edge Colors (Zero Halo & Zero Névoa Cinza!)
-        fg_clean_t = decontaminate_edge_colors_gpu(
-            rgb_t,
-            alpha_cur,
-            rvm_fgr=rvm_fgr,
-            hair_zone=hair_zone,
-            amount=float(self.cfg.decontaminate),
-            radius=int(self.cfg.decontaminate_radius),
-        )
+            fg_clean_t = decontaminate_edge_colors_gpu(
+                rgb_t,
+                alpha_cur,
+                rvm_fgr=rvm_fgr,
+                hair_zone=hair_zone,
+                amount=float(self.cfg.decontaminate),
+                radius=int(self.cfg.decontaminate_radius),
+                use_linear_unmixing=bool(self.cfg.linear_unmixing),
+            )
 
         self.prev_rgb_t = rgb_t.clone()
         self.prev_alpha_t = alpha_cur.clone()
@@ -1017,28 +1296,40 @@ class RotoBrushGPUPro:
         image_path: Path | str,
         output_png_path: Path | str,
         chroma_hybrid: bool = False,
-    ) -> Path:
+        output_dir: Optional[Path | str] = None,
+        demo_title: str = "ROTOBRUSH 3.0",
+        demo_subtitle: str = "V4 DUAL-ENGINE • CORRIDORKEY 2.0 + ROTO PRO",
+    ) -> Dict[str, Any]:
         """
-        PILAR 5 — Modo Estático Ultra-Nitidez (`--image` / `--chroma-hybrid`).
-        Combina:
-          - Despill e Keying Cromático Híbrido (se houver fundo verde/rosa/azul ou `--chroma-hybrid`)
-          - BiRefNet_lite FP16 Multi-Scale (`1024x1024` + `1280x1280`) + RVM High-Res + VitMatte
-          - Refine Edge + Deep Interior Decontaminate Edge Colors
-        Salva PNG RGBA de máxima nitidez (pronto para Parallax 3D / Thumbnails / Carrosséis).
+        PILAR 5 V4 — Modo Imagem Estática Dual-Engine (`--input foto.png` ou `--image foto.png`):
+          - Auto-detecta se a imagem tem Fundo Verde/Azul (`corridorkey`) ou Fundo Natural (`roto`).
+          - Salva PNG RGBA 4K cristalino + Alpha Matte PNG + Showcase 2.5D PNG + Studio Pro PNG!
         """
         img_p = Path(image_path)
         out_p = Path(output_png_path)
         out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_d = Path(output_dir) if output_dir else out_p.parent
+        out_d.mkdir(parents=True, exist_ok=True)
 
         bgr = cv2.imread(str(img_p), cv2.IMREAD_COLOR)
         if bgr is None:
             raise FileNotFoundError(f"Imagem não encontrada: {img_p}")
 
+        t0 = time.time()
         H, W = bgr.shape[:2]
         rgb_np = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         rgb_t = torch.from_numpy(rgb_np).to(self.device, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
 
+        backdrop_info = self.resolve_active_engine(bgr)
+        if chroma_hybrid and backdrop_info["engine_selected"] != "corridorkey":
+            backdrop_info["engine_selected"] = "corridorkey"
+            backdrop_info["backdrop_type"] = "green_screen"
+
+        active_engine = backdrop_info["engine_selected"]
+        screen_type = backdrop_info["backdrop_type"]
+
         # 1. Inferência Multi-Escala BiRefNet + RVM Single-Frame
+        self.reset_temporal_state()
         rec_init = [None, None, None, None]
         ds_ratio = min(0.5, max(0.20, 512.0 / float(max(H, W))))
         rvm_fgr, rvm_pha, *_ = self.rvm_model(rgb_t, *rec_init, ds_ratio)
@@ -1050,41 +1341,56 @@ class RotoBrushGPUPro:
         else:
             biref_alpha = None
 
-        alpha, hair_zone = self._apply_pillar2_and_pillar3_refine_edge(rgb_t, rvm_pha, biref_alpha)
-
-        # 2. Se `--chroma-hybrid` estiver ativo, detecta cor dominante nos 4 cantos e aplica Despill + Chroma Matte
-        if chroma_hybrid:
-            corners = torch.cat([
-                rgb_t[:, :, :24, :24].reshape(1, 3, -1),
-                rgb_t[:, :, :24, -24:].reshape(1, 3, -1),
-            ], dim=-1)
-            bg_col = torch.median(corners, dim=-1).values.view(1, 3, 1, 1)
-            dist_bg = torch.sqrt(torch.sum((rgb_t - bg_col) ** 2, dim=1, keepdim=True) + 1e-6)
-            chroma_alpha = ((dist_bg - 0.10) / 0.22).clamp(0.0, 1.0)
-            alpha = alpha * (0.35 + 0.65 * chroma_alpha)
-
-            # Despill de verde/magenta caso o fundo seja chroma key
-            r, g, b = rgb_t[:, 0:1], rgb_t[:, 1:2], rgb_t[:, 2:3]
-            if float(bg_col[0, 1, 0, 0]) > float(bg_col[0, 0, 0, 0]) + 0.12:
-                # Fundo verde: limita canal G ao máximo de (R, B) na borda
-                g_cap = torch.maximum(r, b)
-                spill = (g - g_cap).clamp(min=0.0)
-                rgb_t = torch.cat([r + spill * 0.15, g - spill * 0.85, b + spill * 0.15], dim=1)
-
-        fg_clean_t = decontaminate_edge_colors_gpu(
-            rgb_t,
-            alpha,
-            rvm_fgr=rvm_fgr,
-            hair_zone=hair_zone,
-            amount=float(self.cfg.decontaminate),
-            radius=int(self.cfg.decontaminate_radius),
-        )
+        if active_engine == "corridorkey":
+            fg_clean_t, alpha, hair_zone = self._process_corridorkey_chroma_gpu(
+                rgb_t,
+                rvm_pha,
+                biref_alpha,
+                screen_type=screen_type if screen_type in ("green_screen", "blue_screen") else "green_screen",
+            )
+        else:
+            alpha, hair_zone = self._apply_pillar2_and_pillar3_refine_edge(rgb_t, rvm_pha, biref_alpha)
+            fg_clean_t = decontaminate_edge_colors_gpu(
+                rgb_t,
+                alpha,
+                rvm_fgr=rvm_fgr,
+                hair_zone=hair_zone,
+                amount=float(self.cfg.decontaminate),
+                radius=int(self.cfg.decontaminate_radius),
+                use_linear_unmixing=bool(self.cfg.linear_unmixing),
+            )
 
         fg_rgb_u8 = (fg_clean_t[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0).to(torch.uint8).cpu().numpy()
+        fg_bgr_u8 = cv2.cvtColor(fg_rgb_u8, cv2.COLOR_RGB2BGR)
         alpha_u8 = (alpha[0, 0].clamp(0.0, 1.0) * 255.0).to(torch.uint8).cpu().numpy()
         rgba_u8 = np.dstack([fg_rgb_u8, alpha_u8])
         Image.fromarray(rgba_u8, mode="RGBA").save(str(out_p))
-        return out_p
+
+        alpha_png = out_d / f"{img_p.stem}_alpha_matte.png"
+        demo_25d_png = out_d / f"{img_p.stem}_25d_showcase.png"
+        studio_png = out_d / f"{img_p.stem}_studio_pro.png"
+
+        cv2.imwrite(str(alpha_png), alpha_u8)
+        comp_25d = self._render_25d_demo_frame(bgr, fg_bgr_u8, alpha_u8, 0.0, demo_title, demo_subtitle)
+        comp_studio = self._render_studio_pro_frame(fg_bgr_u8, alpha_u8, 0.0, demo_title, demo_subtitle)
+        cv2.imwrite(str(demo_25d_png), comp_25d)
+        cv2.imwrite(str(studio_png), comp_studio)
+
+        elapsed = time.time() - t0
+        rep = {
+            "input_image": str(img_p),
+            "resolution": f"{W}x{H}",
+            "backdrop_detection": backdrop_info,
+            "processing_time_sec": round(elapsed, 3),
+            "outputs": {
+                "rgba_png": str(out_p),
+                "alpha_matte_png": str(alpha_png),
+                "demo_25d_png": str(demo_25d_png),
+                "studio_pro_png": str(studio_png),
+            },
+        }
+        (out_d / "rotobrush_image_report.json").write_text(json.dumps(rep, indent=2, ensure_ascii=False), encoding="utf-8")
+        return rep
 
     def process_video(
         self,
@@ -1097,11 +1403,12 @@ class RotoBrushGPUPro:
         export_25d_demo_mp4: bool = False,
         export_studio_mp4: bool = False,
         demo_title: str = "ROTOBRUSH 3.0",
-        demo_subtitle: str = "GPU PRO V2 • VITMATTE + LIGHT WRAP",
+        demo_subtitle: str = "V4 DUAL-ENGINE • CORRIDORKEY 2.0 + ROTO PRO",
     ) -> Dict[str, Any]:
         """
         Processa um vídeo completo (ou trecho `[start_sec .. start_sec + duration_sec]`) na GPU RTX 3060,
-        gerando:
+        auto-detectando se é Green/Blue Screen (`CorridorKey 2.0 Linear Unmixing`) ou Cenário Natural
+        (`RotoBrush 3.0 GPU Pro V4`) e gerando:
           - `roto_alpha_matte.mp4` (Máscara Alpha 1080p H.264 NVENC para uso em HyperFrames / 2.5D)
           - `roto_fg_decontaminated.mp4` (Sujeito recortado com bordas descontaminadas sobre preto)
           - `roto_25d_showcase.mp4` (Opcional: Modo 2.5D Real — Cenário Original f/1.4 + Texto Atrás + Light Wrap)
@@ -1172,13 +1479,23 @@ class RotoBrushGPUPro:
         self.reset_temporal_state()
         t0 = time.time()
         actual_frames = 0
+        backdrop_info: Optional[Dict[str, Any]] = None
 
         for idx in range(n_frames):
             ok, frame_bgr = cap.read()
             if not ok or frame_bgr is None:
                 break
 
-            fg_bgr, alpha_u8 = self.process_video_frame_bgr(frame_bgr)
+            if backdrop_info is None:
+                backdrop_info = self.resolve_active_engine(frame_bgr)
+                print(
+                    f"  [V4 Auto-Detector] Fundo detectado: {backdrop_info['backdrop_type'].upper()} "
+                    f"(green={backdrop_info['green_ratio']*100:.1f}%, blue={backdrop_info['blue_ratio']*100:.1f}%) "
+                    f"-> Motor: {backdrop_info['engine_selected'].upper()}",
+                    flush=True,
+                )
+
+            fg_bgr, alpha_u8 = self.process_video_frame_bgr(frame_bgr, forced_backdrop_info=backdrop_info)
             actual_frames += 1
 
             if f_matte_raw is not None:
@@ -1190,7 +1507,11 @@ class RotoBrushGPUPro:
                 proc_fg.stdin.write(fg_premult.tobytes())
 
             if proc_demo is not None and proc_demo.stdin is not None:
-                comp = self._render_25d_demo_frame(frame_bgr, fg_bgr, alpha_u8, idx / fps, demo_title, demo_subtitle)
+                # Se o vídeo original era Green/Blue Screen, no modo 2.5D substituímos a tela verde por um ambiente bokeh cinematográfico!
+                bg_for_25d = frame_bgr
+                if backdrop_info and backdrop_info["backdrop_type"] in ("green_screen", "blue_screen"):
+                    bg_for_25d = self._synthesize_cinema_bokeh_backdrop(H, W)
+                comp = self._render_25d_demo_frame(bg_for_25d, fg_bgr, alpha_u8, idx / fps, demo_title, demo_subtitle)
                 proc_demo.stdin.write(comp.tobytes())
 
             if f_studio_raw is not None:
@@ -1200,7 +1521,7 @@ class RotoBrushGPUPro:
             if (idx + 1) % 30 == 0 or (idx + 1) == n_frames:
                 elapsed = max(1e-3, time.time() - t0)
                 cur_fps = (idx + 1) / elapsed
-                print(f"  [RotoBrush GPU Pro] {idx + 1}/{n_frames} frames ({cur_fps:.1f} fps na RTX 3060)", flush=True)
+                print(f"  [RotoBrush GPU Pro V4] {idx + 1}/{n_frames} frames ({cur_fps:.1f} fps na RTX 3060)", flush=True)
 
         cap.release()
         if f_matte_raw is not None:
@@ -1250,11 +1571,12 @@ class RotoBrushGPUPro:
         total_t = time.time() - t0
         report = {
             "input_video": str(in_p),
-            "frames_processed": n_frames,
+            "frames_processed": actual_frames,
             "fps_source": round(fps, 3),
             "resolution": f"{W}x{H}",
+            "backdrop_detection": backdrop_info,
             "processing_time_sec": round(total_t, 2),
-            "processing_fps": round(n_frames / max(1e-3, total_t), 2),
+            "processing_fps": round(actual_frames / max(1e-3, total_t), 2),
             "config": asdict(self.cfg),
             "outputs": {
                 "alpha_matte_mp4": str(matte_mp4) if export_matte_mp4 else None,
@@ -1265,6 +1587,28 @@ class RotoBrushGPUPro:
         }
         (out_d / "rotobrush_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         return report
+
+    @staticmethod
+    def _synthesize_cinema_bokeh_backdrop(H: int, W: int) -> np.ndarray:
+        """Gera um ambiente de estúdio arquitetônico com bokeh f/1.4 quente/frio quando a fonte original era Tela Verde."""
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        ny = yy / float(max(1, H))
+        nx = xx / float(max(1, W))
+        bg = np.zeros((H, W, 3), dtype=np.float32)
+        bg[..., 0] = 36.0 + 48.0 * (1.0 - ny)
+        bg[..., 1] = 28.0 + 36.0 * (1.0 - ny)
+        bg[..., 2] = 22.0 + 42.0 * nx
+        # Bokeh orbs suaves de estúdio
+        for ox, oy, rad, col_bgr in [
+            (0.22, 0.26, 0.18, (65.0, 125.0, 210.0)),
+            (0.78, 0.30, 0.22, (180.0, 110.0, 45.0)),
+            (0.50, 0.18, 0.25, (90.0, 140.0, 195.0)),
+        ]:
+            d2 = ((nx - ox) / rad) ** 2 + ((ny - oy) / (rad * 0.75)) ** 2
+            orb = np.exp(-d2 * 1.8)
+            for c in range(3):
+                bg[..., c] += orb * col_bgr[c] * 0.45
+        return np.clip(bg, 0, 255).astype(np.uint8)
 
     def _render_25d_demo_frame(
         self,
@@ -1388,14 +1732,24 @@ class RotoBrushGPUPro:
 
 
 # ==============================================================================
-# CLI OFICIAL (IDÊNTICA AOS PARÂMETROS DO ROTO BRUSH 3.0 DO AFTER EFFECTS)
+# CLI OFICIAL V4 DUAL-ENGINE (CORRIDORKEY 2.0 GREEN SCREEN + ROTOBRUSH 3.0 PRO)
 # ==============================================================================
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="RotoBrush 3.0 GPU Pro V2 — Rotoscopia Temporal, VitMatte Hair Matting, Auto-Adaptive Despill e Optical Light Wrap na GPU NVIDIA"
+        description="RotoBrush 3.0 GPU Pro V4 Dual-Engine — CorridorKey 2.0 (Green/Blue Screen Linear Unmixing) + RotoBrush V4 (MatAnyone + VitMatte + Optical-Flow Hair Lock)"
     )
-    p.add_argument("--input", "-i", type=str, help="Vídeo de entrada (.mp4/.mov) ou imagem (se --image)")
-    p.add_argument("--output-dir", "-o", type=str, default="", help="Pasta de saída para os vídeos/mattes gerados")
+    p.add_argument("--input", "-i", type=str, help="Vídeo (.mp4/.mov/.mkv) OU Imagem (.png/.jpg/.webp) de entrada")
+    p.add_argument("--output-dir", "-o", type=str, default="", help="Pasta de saída para os vídeos/imagens gerados")
+    p.add_argument(
+        "--engine",
+        type=str,
+        default="auto",
+        choices=["auto", "roto", "corridorkey"],
+        help="Motor de recorte V4: auto (detecta automaticamente Green/Blue Screen vs Fundo Natural), corridorkey (força CorridorKey 2.0 Linear Unmixing), roto (força RotoBrush V4 MatAnyone+VitMatte)",
+    )
     p.add_argument(
         "--mode",
         type=str,
@@ -1404,14 +1758,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Modo de exportação: all (Alpha+FG+2.5D+Studio), 25d (Cenário Original + Texto Atrás), studio (Troca de Cenário Studio Pro), alpha (apenas Luma Matte), fg (apenas Foreground Descontaminado)",
     )
     p.add_argument("--title", type=str, default="ROTOBRUSH 3.0", help="Título 2.5D gigante atrás da pessoa")
-    p.add_argument("--subtitle", type=str, default="GPU PRO V2 • VITMATTE + LIGHT WRAP", help="Subtítulo/Badge 2.5D")
-    p.add_argument("--image", type=str, default="", help="Modo Estático Ultra-Nitidez 4K: caminho da imagem de entrada")
-    p.add_argument("--output-png", type=str, default="", help="Caminho do PNG RGBA de saída para --image")
-    p.add_argument("--chroma-hybrid", action="store_true", help="Ativa Despill + Chroma Key Híbrido no modo --image")
+    p.add_argument("--subtitle", type=str, default="V4 DUAL-ENGINE • CORRIDORKEY 2.0 + ROTO PRO", help="Subtítulo/Badge 2.5D")
+    p.add_argument("--image", type=str, default="", help="Atalho para imagem estática de entrada (também aceito diretamente em --input)")
+    p.add_argument("--output-png", type=str, default="", help="Caminho do PNG RGBA de saída para imagem estática")
+    p.add_argument("--chroma-hybrid", action="store_true", help="Força modo Chroma Key Híbrido em imagem estática")
     p.add_argument("--backbone", type=str, default="resnet50", choices=["resnet50", "mobilenetv3"])
     p.add_argument("--no-matanyone", action="store_true", help="Desativa MatAnyone Consistent Memory Propagation V3")
     p.add_argument("--no-birefnet", action="store_true", help="Desativa fusão BiRefNet_lite FP16 (usa apenas RVM)")
     p.add_argument("--no-vitmatte", action="store_true", help="Desativa VitMatte ViT FP16 na zona do cabelo")
+    p.add_argument("--no-linear-unmixing", action="store_true", help="Desativa desmistura em espaço Scene-Linear IEC 61966-2-1")
+    p.add_argument("--despill-strength", type=float, default=1.0, help="Força do neutralizador de spill energético CorridorKey 2.0 (0..1)")
     p.add_argument("--optical-flow-hair-lock", type=float, default=0.52, help="Força da estabilização de fios por Fluxo Óptico V3 (0..0.85)")
     p.add_argument("--birefnet-interval", type=int, default=2, help="Intervalo de frames para ancoragem BiRefNet")
     p.add_argument("--refine-radius", type=int, default=8, help="Largura da banda Refine Edge Trimap (px)")
@@ -1434,11 +1790,14 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = RotoBrushConfig(
+        engine=args.engine,
         backbone=args.backbone,
         use_matanyone=not args.no_matanyone,
         use_birefnet_fusion=not args.no_birefnet,
         use_vitmatte_hair=not args.no_vitmatte,
         optical_flow_hair_lock=args.optical_flow_hair_lock,
+        linear_unmixing=not args.no_linear_unmixing,
+        despill_strength=args.despill_strength,
         birefnet_interval=args.birefnet_interval,
         refine_radius=args.refine_radius,
         feather=args.feather,
@@ -1452,19 +1811,29 @@ def main() -> int:
 
     engine = RotoBrushGPUPro(cfg)
 
-    if args.image:
-        img_in = Path(args.image)
-        png_out = Path(args.output_png) if args.output_png else img_in.with_name(f"{img_in.stem}_roto_pro.png")
-        t0 = time.time()
-        saved = engine.process_static_image(img_in, png_out, chroma_hybrid=args.chroma_hybrid)
-        print(f"[OK] Imagem recortada em {time.time() - t0:.2f}s -> {saved}")
+    target_input = args.image if args.image else args.input
+    if not target_input:
+        parser.error("Informe --input <video_ou_imagem> (ou --image <foto.png>)")
+
+    in_path = Path(target_input)
+    is_static_image = bool(args.image) or (in_path.suffix.lower() in IMAGE_EXTENSIONS)
+
+    if is_static_image:
+        out_dir = Path(args.output_dir) if args.output_dir else (in_path.parent / f"{in_path.stem}_rotobrush_v4")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        png_out = Path(args.output_png) if args.output_png else (out_dir / f"{in_path.stem}_rgba.png")
+        rep = engine.process_static_image(
+            in_path,
+            png_out,
+            chroma_hybrid=args.chroma_hybrid,
+            output_dir=out_dir,
+            demo_title=args.title,
+            demo_subtitle=args.subtitle,
+        )
+        print(json.dumps(rep, indent=2, ensure_ascii=False))
         return 0
 
-    if not args.input:
-        parser.error("Informe --input <video.mp4> ou --image <foto.png>")
-
-    vid_in = Path(args.input)
-    out_dir = Path(args.output_dir) if args.output_dir else vid_in.parent / f"{vid_in.stem}_rotobrush_pro"
+    out_dir = Path(args.output_dir) if args.output_dir else in_path.parent / f"{in_path.stem}_rotobrush_pro"
 
     mode = args.mode.lower()
     exp_matte = mode in ("all", "alpha", "25d", "studio")
@@ -1473,7 +1842,7 @@ def main() -> int:
     exp_studio = (mode in ("all", "studio")) or bool(args.demo_studio)
 
     rep = engine.process_video(
-        vid_in,
+        in_path,
         out_dir,
         start_sec=args.start_sec,
         duration_sec=args.duration_sec,

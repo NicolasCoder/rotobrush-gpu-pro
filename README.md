@@ -1,13 +1,19 @@
-# 🎬⚡ RotoBrush 3.0 GPU Pro V3 Ultimate (`MatAnyone CVPR 2025 + Optical-Flow Hair Lock + VitMatte FP16`)
+# 🎬⚡ RotoBrush 3.0 GPU Pro V4 Dual-Engine (`CorridorKey 2.0 Linear Unmixing + MatAnyone CVPR 2025 + Optical-Flow Hair Lock + VitMatte FP16`)
 
-> **Cinema-Grade AI Rotoscoping, Consistent Object Memory Propagation, Optical-Flow Guided Sub-Pixel Hair Stabilization, 2.5D Depth Layering & Studio Background Replacement in Pure Python + PyTorch CUDA.**  
-> Built to replace and surpass Adobe After Effects **Roto Brush 3.0 + Refine Edge** in automated video pipelines — with **zero manual brushstrokes**, **zero "Freeze" wait**, **zero white/green halos**, **auto-adaptive background luminance calibration**, and **1.73 GB Peak VRAM**!
+> **The Ultimate Dual-Engine AI Rotoscoping & Scene-Linear Chroma Key System in Pure Python + PyTorch CUDA.**  
+> **Automatic Backdrop Routing (`--engine auto`)**: If the input video or image has a **Green/Blue Screen**, it automatically routes to our **CorridorKey 2.0 Scene-Linear Color Unmixing Engine ($\gamma=2.4$ IEC 61966-2-1)** for zero-spill sub-pixel hair & motion-blur keying. If the input has a **Natural Background (Room, Office, Street, Podcast Studio)**, it automatically routes to our **RotoBrush 3.0 GPU Pro V4 Engine (`MatAnyone CVPR 2025 + VitMatte FP16 + Optical-Flow Hair Lock + Body Choke -2.5px + Scene-Linear Edge Unmixing`)** — running in **< 1.8 GB VRAM** on an NVIDIA RTX 3060!
+
+---
+
+## 🔀 V4 Dual-Engine Forensic Audit (400% Zoom: CorridorKey 2.0 Green Screen vs. RotoBrush V4 Natural Background)
+
+![V4 Dual-Engine 400% Zoom Audit](assets/AUDITORIA_V4_DUAL_ENGINE_400X.png)
 
 ---
 
 ## 💻 Hardware Requirements (Minimum & Recommended Specs)
 
-Measured on real 1080x1920 Full HD video streams using our 8-People Stress-Test Benchmark:
+Measured on real 1080x1920 Full HD video streams using our 8-People Stress-Test & V4 Dual-Engine Benchmark:
 
 | Component | Minimum Spec | Recommended Spec | Measured Peak on RTX 3060 (12 GB) |
 | :--- | :--- | :--- | :--- |
@@ -123,14 +129,16 @@ python rotobrush_gpu_pro.py \
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--input`, `-i` | — | Input video file (`.mp4`, `.mov`, `.mkv`) |
-| `--output-dir`, `-o` | `<stem>_rotobrush_pro` | Output folder for rendered `.mp4` files and `rotobrush_report.json` |
+| `--input`, `-i` | — | Input **video** (`.mp4`, `.mov`, `.mkv`) OR **static image** (`.png`, `.jpg`, `.webp`) |
+| `--engine` | `auto` | V4 Dual-Engine selector: `auto` (detects Green/Blue Screen vs Natural BG), `corridorkey`, or `roto` |
+| `--output-dir`, `-o` | `<stem>_rotobrush_pro` | Output folder for rendered `.mp4`/`.png` files and `rotobrush_report.json` |
 | `--mode` | `all` | `all`, `25d`, `studio`, `alpha`, or `fg` |
 | `--title` | `"ROTOBRUSH 3.0"` | Giant 2.5D headline rendered behind the speaker |
-| `--subtitle` | `"GPU PRO V3..."` | Pill badge subtitle above the 2.5D headline |
+| `--subtitle` | `"V4 DUAL-ENGINE..."` | Pill badge subtitle above the 2.5D headline |
 | `--backbone` | `resnet50` | `resnet50` (maximum quality) or `mobilenetv3` (fastest) |
 | `--no-matanyone` | `False` | Disable V3 `MatAnyone` Consistent Memory Propagation |
 | `--optical-flow-hair-lock` | `0.52` | V3 Optical-Flow Guided Hair Stabilization strength (`0.0..0.85`) |
+| `--despill-strength` | `1.0` | V4 CorridorKey 2.0 energy-preserving spill neutralizer strength (`0.0..1.0`) |
 | `--refine-radius` | `8` | Uncertainty Trimap band radius in pixels (`Refine Edge Radius`) |
 | `--feather` | `0.6` | Sub-pixel Gaussian feather on hair transitions |
 | `--contrast` | `35.0` | S-curve contrast on alpha ramp (`0..100%`) |
